@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -167,6 +168,11 @@ func wrapEvent(ev any) *pubsub.Payload {
 		return envelope(pubsub.PayloadTypeSession, pubsub.Event[proto.Session]{
 			Type:    e.Type,
 			Payload: sessionToProto(e.Payload),
+		})
+	case pubsub.Event[goal.Snapshot]:
+		return envelope(pubsub.PayloadTypeGoal, pubsub.Event[proto.GoalState]{
+			Type:    e.Type,
+			Payload: goalSnapshotToProto(e.Payload),
 		})
 	case pubsub.Event[history.File]:
 		return envelope(pubsub.PayloadTypeFile, pubsub.Event[proto.File]{

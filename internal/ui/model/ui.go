@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/fsext"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/home"
 	"github.com/charmbracelet/crush/internal/lsp"
@@ -291,6 +292,7 @@ type UI struct {
 
 	dialog *dialog.Overlay
 	status *Status
+	goal   goalUIState
 
 	// isCanceling tracks whether the user has pressed escape once to cancel.
 	isCanceling bool
@@ -674,6 +676,9 @@ func (m *UI) SetProgram(program *tea.Program) {
 // Init initializes the UI model.
 func (m *UI) Init() tea.Cmd {
 	var cmds []tea.Cmd
+	if cmd := m.fetchGoalState(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	if m.state == uiOnboarding {
 		if cmd := m.openModelsDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -928,6 +933,14 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handlePlanHandoff(msg.Payload); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case pubsub.Event[goal.Snapshot]:
+		m.applyGoalSnapshot(msg.Payload)
+	case goalLoadedMsg:
+		cmds = append(cmds, m.applyGoalLoaded(msg)...)
+	case goalSetMsg:
+		cmds = append(cmds, m.applyGoalSet(msg)...)
+	case goalCanceledMsg:
+		cmds = append(cmds, m.applyGoalCanceled(msg)...)
 	case busyStateMsg:
 		cmds = append(cmds, m.applyBusyState(msg)...)
 	case promptQueueMsg:
@@ -995,6 +1008,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 		cmds = append(cmds, m.startLSPs(msg.lspFilePaths()))
+		if cmd := m.fetchGoalState(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		msgs := msg.messages
 		if cmd := m.setSessionMessages(msgs); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -1530,6 +1546,12 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case tea.PasteMsg:
+		if m.dialog.ContainsDialog(dialog.GoalID) {
+			if cmd := m.handleDialogMsg(msg); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
+		}
 		if m.activeInline != nil && m.focus == uiFocusEditor {
 			if p, ok := m.activeInline.(dialog.PasteableEditor); ok {
 				if cmd := p.HandlePaste(msg); cmd != nil {
@@ -1615,7 +1637,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case app.UpdateAvailableMsg:
 		text := fmt.Sprintf("Crush update available: v%s → v%s.", msg.CurrentVersion, msg.LatestVersion)
 		if msg.IsDevelopment {
-			text = fmt.Sprintf("This is a development version of Crush. The latest version is v%s.", msg.LatestVersion)
+			// Crusher: Keep the development notice disabled, not deleted.
+			// text = fmt.Sprintf("This is a development version of Crush. The latest version is v%s.", msg.LatestVersion)
+			break
 		}
 		cmds = append(cmds, m.status.Show(util.InfoMsg{
 			Type: util.InfoTypeUpdate,
@@ -1906,6 +1930,15 @@ func (m *UI) handleConnectionEvent(msg workspace.ConnectionEvent) []tea.Cmd {
 	}
 	cmds := []tea.Cmd{m.status.Show(info)}
 	if msg.State == workspace.ConnectionRecovered {
+		m.goal.connectionGeneration++
+		m.goal.appliedVersion = 0
+		m.goal.snapshot = goal.Snapshot{}
+		m.refreshGoalCommandState()
+		m.updateLayoutAndSize()
+		m.invalidateFrames()
+		if cmd := m.fetchGoalState(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		// Events published while the stream was down are gone: re-sync the
 		// memoized MCP states alongside the session reload.
 		if cmd := m.requestMCPRefresh(); cmd != nil {
@@ -2277,6 +2310,10 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	switch msg := action.(type) {
 	// Generic dialog messages
 	case dialog.ActionClose:
+		closingGoal := false
+		if front := m.dialog.DialogLast(); front != nil {
+			closingGoal = front.ID() == dialog.GoalID
+		}
 		if isOnboarding && m.dialog.ContainsDialog(dialog.ModelsID) {
 			break
 		}
@@ -2293,7 +2330,9 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			}
 		}
 
-		if m.focus == uiFocusEditor {
+		if closingGoal {
+			cmds = append(cmds, m.restoreGoalEditorFocus())
+		} else if m.focus == uiFocusEditor {
 			cmds = append(cmds, m.textarea.Focus())
 		}
 	case dialog.ActionCloseOAuth:
@@ -2335,6 +2374,10 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		if cmd := m.openDialog(msg.DialogID); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.ActionSetGoal:
+		cmds = append(cmds, m.handleSetGoal(msg))
+	case dialog.ActionCancelGoal:
+		cmds = append(cmds, m.handleCancelGoal(msg))
 
 	// Command dialog messages.
 	case dialog.ActionToggleYoloMode:
@@ -3826,6 +3869,7 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 		m.drawHeader(scr, layout.header)
 		main := uv.NewStyledString(m.landingView())
 		main.Draw(scr, layout.main)
+		m.drawGoal(scr, layout.goal)
 
 		if m.activeInline != nil {
 			m.activeInline.SetFocused(m.focus == uiFocusEditor)
@@ -3852,6 +3896,7 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 		if layout.pills.Dy() > 0 && m.pillsView != "" {
 			uv.NewStyledString(m.pillsView).Draw(scr, layout.pills)
 		}
+		m.drawGoal(scr, layout.goal)
 
 		if m.activeInline != nil {
 			m.activeInline.SetFocused(m.focus == uiFocusEditor)
@@ -4762,7 +4807,7 @@ func (m *UI) generateLayout(w, h int) uiLayout {
 		}
 	}
 
-	return uiLayout
+	return m.applyGoalLayout(uiLayout)
 }
 
 // uiLayout defines the positioning of UI elements.
@@ -4781,6 +4826,9 @@ type uiLayout struct {
 
 	// pills is the area for the pills panel.
 	pills uv.Rectangle
+
+	// goal is the optional current-goal strip.
+	goal uv.Rectangle
 
 	// editor is the area for the editor pane.
 	editor uv.Rectangle
@@ -5440,6 +5488,10 @@ func (m *UI) refreshStyles() {
 	if r, ok := m.activeInline.(dialog.StyleRefresher); ok {
 		r.RefreshStyles()
 	}
+	if m.width > 0 && m.height > 0 {
+		m.updateLayoutAndSize()
+	}
+	m.invalidateFrames()
 }
 
 // attachSkill reads a skill's content by ID and returns it as a markdown
@@ -5834,6 +5886,10 @@ func (m *UI) openDialog(id string) tea.Cmd {
 		if cmd := m.openSkillsTogglesDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.GoalID:
+		if cmd := m.openGoalDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case dialog.FilePickerID:
 		if cmd := m.openFilesDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5892,7 +5948,10 @@ func (m *UI) openCommandsDialog() tea.Cmd {
 	if m.dialog.ContainsDialog(dialog.CommandsID) {
 		// Bring to front
 		m.dialog.BringToFront(dialog.CommandsID)
-		return nil
+		if commands, ok := m.dialog.Dialog(dialog.CommandsID).(*dialog.Commands); ok {
+			commands.SetGoalState(m.goal.snapshot, m.goalAvailable())
+		}
+		return m.fetchGoalState()
 	}
 
 	var sessionID string
@@ -5908,9 +5967,10 @@ func (m *UI) openCommandsDialog() tea.Cmd {
 		return util.ReportError(err)
 	}
 
+	commands.SetGoalState(m.goal.snapshot, m.goalAvailable())
 	m.dialog.OpenDialog(commands)
 
-	return commands.InitialCmd()
+	return tea.Batch(commands.InitialCmd(), m.fetchGoalState())
 }
 
 // openReasoningDialog opens the reasoning effort dialog.

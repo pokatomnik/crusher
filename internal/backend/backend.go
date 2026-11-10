@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/skills"
@@ -119,6 +120,9 @@ type Backend struct {
 	// be handed a workspace on a process that is already leaving.
 	// [Backend.ShutdownWorkspaces] sets it too, for an external stop.
 	closing bool
+	// goalShutdownStarted selects the shutdown caller that closes the
+	// shared goal service after its workspaces stop. Guarded by mu.
+	goalShutdownStarted bool
 	// retired holds the IDs of clients that announced their exit via
 	// RetireClient. Creates from a retired client are refused, which is what
 	// lets a client release a workspace whose ID it never learned.
@@ -137,6 +141,7 @@ type Backend struct {
 	cfg         *config.ConfigStore
 	ctx         context.Context
 	shutdownFn  ShutdownFunc
+	goalService *goal.Service
 	createGrace time.Duration
 	lingerDelay time.Duration
 	detachGrace time.Duration
@@ -277,6 +282,9 @@ func (w *Workspace) Shutdown() {
 	w.closing = true
 	w.runMu.Unlock()
 
+	if w.App != nil {
+		w.App.StopGoalRuntime()
+	}
 	if w.cancel != nil {
 		w.cancel()
 	}
@@ -300,6 +308,7 @@ func New(ctx context.Context, cfg *config.ConfigStore, shutdownFn ShutdownFunc) 
 		cfg:         cfg,
 		ctx:         ctx,
 		shutdownFn:  shutdownFn,
+		goalService: goal.NewService(),
 		createGrace: DefaultCreateGrace,
 		lingerDelay: idleShutdownDelayFromEnv(),
 		detachGrace: durationFromEnv("CRUSH_SERVER_DETACH_GRACE", DefaultDetachGrace),
@@ -398,6 +407,11 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 		b.mu.Unlock()
 		return nil, proto.Workspace{}, err
 	}
+	// Keep manually assembled Backends used by embedders and tests on the
+	// same singleton service path as New-created instances.
+	if b.goalService == nil {
+		b.goalService = goal.NewService()
+	}
 	// A client is arriving: cancel any pending idle shutdown so we never
 	// hand back a workspace on a server that is about to tear itself down.
 	b.cancelShutdownLocked()
@@ -477,7 +491,10 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 		skills.WithWorkingDir(discoveryCfg.WorkingDir),
 	)
 
-	appWorkspace, err := app.New(b.ctx, conn, cfg, skillsMgr)
+	appWorkspace, err := app.New(b.ctx, conn, cfg, skillsMgr, app.GoalOptions{
+		Service:     b.goalService,
+		WorkspaceID: id,
+	})
 	if err != nil {
 		return nil, proto.Workspace{}, fmt.Errorf("failed to create app workspace: %w", err)
 	}
@@ -1133,6 +1150,8 @@ func (b *Backend) ShutdownWorkspaces(ctx context.Context) error {
 	b.mu.Lock()
 	b.closing = true
 	b.cancelShutdownLocked()
+	closeGoalService := !b.goalShutdownStarted
+	b.goalShutdownStarted = true
 	var owned []*Workspace
 	for _, ws := range slices.Collect(b.workspaces.Seq()) {
 		if b.unregisterLocked(ws) {
@@ -1144,6 +1163,9 @@ func (b *Backend) ShutdownWorkspaces(ctx context.Context) error {
 	remaining := csync.NewMap[string, struct{}]()
 	var wg sync.WaitGroup
 	for _, ws := range owned {
+		if ws.App != nil {
+			ws.App.StopGoalRuntime()
+		}
 		slog.Info("Shutting down workspace", "workspace", ws.ID)
 		remaining.Set(ws.ID, struct{}{})
 		wg.Go(func() {
@@ -1154,6 +1176,9 @@ func (b *Backend) ShutdownWorkspaces(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
+		if closeGoalService && b.goalService != nil {
+			b.goalService.Shutdown()
+		}
 		close(done)
 	}()
 

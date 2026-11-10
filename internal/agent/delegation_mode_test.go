@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,12 +35,12 @@ func TestEffectiveToolNamesByRunMode(t *testing.T) {
 		{
 			name:        "interactive delegates detached",
 			interactive: true,
-			want:        []string{AgentDispatchToolName, AgentSendToolName, "question", "view"},
+			want:        []string{AgentDispatchToolName, AgentSendToolName, "question", "view", "complete_goal"},
 		},
 		{
 			name:        "headless delegates blocking",
 			interactive: false,
-			want:        []string{AgentToolName, "view"},
+			want:        []string{AgentToolName, "view", "complete_goal"},
 		},
 		{
 			name:        "subagents neither fan out nor ask",
@@ -52,22 +53,28 @@ func TestEffectiveToolNamesByRunMode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			c := &coordinator{interactive: tt.interactive}
+			c := &coordinator{interactive: tt.interactive, goal: goal.NewService(), goalWorkspaceID: "workspace"}
 			assert.Equal(t, tt.want, c.effectiveToolNames(agentCfg, tt.isSubAgent))
 		})
 	}
 }
 
-// TestEffectiveToolNamesKeepsConfigAuthoritative checks the gate only ever
-// narrows: a tool the user disabled cannot reappear because of run mode.
+// TestEffectiveToolNamesKeepsConfigAuthoritative checks that goal completion
+// is added to main agents independently of AllowedTools but still honors an
+// explicit configuration disable.
 func TestEffectiveToolNamesKeepsConfigAuthoritative(t *testing.T) {
 	t.Parallel()
 
 	agentCfg := config.Agent{AllowedTools: []string{"view"}}
 	for _, interactive := range []bool{true, false} {
-		c := &coordinator{interactive: interactive}
-		assert.Equal(t, []string{"view"}, c.effectiveToolNames(agentCfg, false))
+		c := &coordinator{interactive: interactive, goal: goal.NewService(), goalWorkspaceID: "workspace"}
+		assert.Equal(t, []string{"view", "complete_goal"}, c.effectiveToolNames(agentCfg, false))
+		assert.Equal(t, []string{"view"}, c.effectiveToolNames(agentCfg, true))
 	}
+
+	cfg := config.NewTestStore(&config.Config{Options: &config.Options{DisabledTools: []string{"complete_goal"}}})
+	c := &coordinator{cfg: cfg, goal: goal.NewService(), goalWorkspaceID: "workspace"}
+	assert.Equal(t, []string{"view"}, c.effectiveToolNames(agentCfg, false))
 }
 
 // TestResolveSubAgentAccess covers how a requested access level maps onto a

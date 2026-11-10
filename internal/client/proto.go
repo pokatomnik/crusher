@@ -291,6 +291,15 @@ func (c *Client) SubscribeEvents(ctx context.Context, id string) (<-chan any, er
 				if !sendEvent(ctx, events, e) {
 					return
 				}
+			case pubsub.PayloadTypeGoal:
+				e, err := decodeGoalEvent(p.Payload)
+				if err != nil {
+					slog.Error("Unmarshaling goal event", "error", err)
+					continue
+				}
+				if !sendEvent(ctx, events, e) {
+					return
+				}
 			default:
 				slog.Warn("Unknown event type", "type", p.Type)
 				continue

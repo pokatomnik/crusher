@@ -73,6 +73,7 @@ type Commands struct {
 
 	customCommands []commands.CustomCommand
 	mcpPrompts     []commands.MCPPrompt
+	goalCommand    goalCommandState
 
 	dockerMCPAvailable     *bool
 	dockerMCPCheckInFlight bool
@@ -535,6 +536,9 @@ func (c *Commands) defaultCommands() []*CommandItem {
 		commands = append(commands, NewCommandItem(c.com.Styles, "toggle_skills", "Toggle Skills", "", ActionOpenDialog{
 			DialogID: SkillsTogglesID,
 		}))
+	}
+	if goalCommand := c.goalCommandItem(); goalCommand != nil {
+		commands = append(commands, goalCommand)
 	}
 
 	if c.hasTodos || c.hasQueue {
