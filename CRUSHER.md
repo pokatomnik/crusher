@@ -8,7 +8,8 @@ changes into upstream documentation files.
 
 The Goal feature gives the current backend process one in-memory goal slot.
 The user starts it from `/` → **Set Goal**, enters a multiline prompt and
-confirms with Ctrl+D. Esc closes the editor without making a request. A root
+confirms with Ctrl+Enter (Cmd+Enter on macOS). Esc closes the editor without
+making a request. A root
 session owns the goal; child sessions cannot set one. While a goal is pending,
 the command palette offers **Cancel Goal**. The **Current goal** strip appears
 only after the initial prompt has been saved and the provider stream has

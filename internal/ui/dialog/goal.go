@@ -1,6 +1,7 @@
 package dialog
 
 import (
+	"runtime"
 	"strings"
 
 	"charm.land/bubbles/v2/help"
@@ -11,10 +12,13 @@ import (
 	goalstate "github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // GoalID identifies the goal editor dialog.
 const GoalID = "goal"
+
+const goalInputPadding = 1
 
 // ActionSetGoal requests installation of a goal for the session captured when
 // the dialog was opened. An empty SessionID means the UI was on the landing
@@ -128,9 +132,19 @@ func NewGoal(com *common.Common, sessionID string) *Goal {
 		help:      help.New(),
 	}
 	d.help.Styles = com.Styles.DialogHelpStyles()
-	d.keyMap.Confirm = key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("Ctrl+D", "- confirm"))
+	d.keyMap.Confirm = goalConfirmBinding(runtime.GOOS)
 	d.closeKey()
 	return d
+}
+
+func goalConfirmBinding(goos string) key.Binding {
+	shortcut := "ctrl+enter"
+	help := "Ctrl+Enter"
+	if goos == "darwin" {
+		shortcut = "super+enter"
+		help = "Cmd+Enter"
+	}
+	return key.NewBinding(key.WithKeys(shortcut), key.WithHelp(help, "- confirm"))
 }
 
 func (d *Goal) closeKey() {
@@ -185,42 +199,122 @@ func (d *Goal) RefreshStyles() {
 	d.input.SetStyles(d.com.Styles.Editor.Textarea)
 }
 
-// Draw implements Dialog.
-func (d *Goal) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
-	t := d.com.Styles
-	width := max(0, min(defaultDialogMaxWidth, area.Dx()-2))
-	height := max(0, area.Dy()-2)
-	viewStyle := t.Dialog.View.Width(width)
-	innerWidth := max(0, width-viewStyle.GetHorizontalFrameSize())
-
-	heightOffset := viewStyle.GetVerticalFrameSize() +
-		t.Dialog.Title.GetVerticalFrameSize() + titleContentHeight +
-		t.Dialog.HelpView.GetVerticalFrameSize() + 1
+func (d *Goal) compactHeader(innerWidth int) string {
+	titleText := "Set Goal"
+	titleStyle := d.com.Styles.Dialog.Title
 	if d.validationError != "" {
-		heightOffset++
+		titleText = d.validationError
+		titleStyle = d.com.Styles.Dialog.TitleError
 	}
-	d.input.SetWidth(innerWidth)
-	d.input.SetHeight(max(1, height-heightOffset))
+
+	helpWidth := max(0, innerWidth-lipgloss.Width(titleText)-titleStyle.GetHorizontalFrameSize()-1)
+	helpView := renderDialogHelp(d.com.Styles, &d.help, d, helpWidth)
+	titleWidth := max(0, innerWidth-lipgloss.Width(helpView)-1)
+	titleContentWidth := max(0, titleWidth-titleStyle.GetHorizontalFrameSize())
+	titleView := titleStyle.Width(titleWidth).Render(ansi.Truncate(titleText, titleContentWidth, "…"))
+	return titleView + " " + helpView
+}
+
+func (d *Goal) renderView(width, maxDialogHeight int) (string, *tea.Cursor) {
+	t := d.com.Styles
+	viewStyle := t.Dialog.View.Width(width)
+	if maxDialogHeight <= 4 {
+		viewStyle = viewStyle.BorderTop(false).BorderBottom(false)
+	}
+	innerWidth := max(0, width-viewStyle.GetHorizontalFrameSize())
+	inputPaddingTop := goalInputPadding
+	inputPaddingBottom := goalInputPadding
+	inputStyle := lipgloss.NewStyle().Padding(inputPaddingTop, goalInputPadding, inputPaddingBottom, goalInputPadding).Width(innerWidth)
+
+	var errorView string
+	if d.validationError != "" {
+		errorText := ansi.Truncate(d.validationError, innerWidth, "…")
+		errorView = t.Dialog.TitleError.Width(innerWidth).Render(errorText)
+	}
+	normalHeightOffset := func() int {
+		return viewStyle.GetVerticalFrameSize() +
+			t.Dialog.Title.GetVerticalFrameSize() + titleContentHeight +
+			inputStyle.GetVerticalFrameSize() +
+			t.Dialog.HelpView.GetVerticalFrameSize() + 1 + lipgloss.Height(errorView)
+	}
+	if normalHeightOffset()+1 > maxDialogHeight && (inputPaddingTop > 0 || inputPaddingBottom > 0) {
+		inputPaddingTop = 0
+		inputPaddingBottom = 0
+		inputStyle = lipgloss.NewStyle().Padding(inputPaddingTop, goalInputPadding, inputPaddingBottom, goalInputPadding).Width(innerWidth)
+	}
+	if normalHeightOffset()+1 > maxDialogHeight && viewStyle.GetVerticalFrameSize() > 0 {
+		viewStyle = viewStyle.BorderTop(false).BorderBottom(false)
+	}
+
+	compactLayout := normalHeightOffset()+1 > maxDialogHeight
+	var compactHeader string
+	heightOffset := normalHeightOffset()
+	if compactLayout {
+		compactHeader = d.compactHeader(innerWidth)
+		heightOffset = viewStyle.GetVerticalFrameSize() + inputStyle.GetVerticalFrameSize() + lipgloss.Height(compactHeader)
+		if maxDialogHeight-heightOffset < 1 {
+			// The header would take the only available line. Keep one
+			// input line (and its cursor) visible instead.
+			compactHeader = ""
+			heightOffset = viewStyle.GetVerticalFrameSize() + inputStyle.GetVerticalFrameSize()
+		}
+	}
+	d.input.SetWidth(max(0, innerWidth-inputStyle.GetHorizontalFrameSize()))
+	d.input.SetHeight(max(1, maxDialogHeight-heightOffset))
 
 	rc := NewRenderContext(t, width)
-	rc.Title = "Set Goal"
-	rc.AddPart(d.input.View())
-	if d.validationError != "" {
-		rc.AddPart(t.Dialog.TitleError.Width(innerWidth).Render(d.validationError))
+	rc.ViewStyle = viewStyle
+	if compactLayout {
+		if compactHeader != "" {
+			rc.AddPart(compactHeader)
+		}
+	} else {
+		rc.Title = "Set Goal"
+		rc.Help = renderDialogHelp(t, &d.help, d, innerWidth)
 	}
-	rc.Help = renderDialogHelp(t, &d.help, d, innerWidth)
+	rc.AddPart(inputStyle.Render(d.input.View()))
+	if !compactLayout && errorView != "" {
+		rc.AddPart(errorView)
+	}
 	view := rc.Render()
 
 	cursor := d.input.Cursor()
 	viewWidth, viewHeight := lipgloss.Size(view)
 	if cursor != nil {
-		cursor.X += viewStyle.GetBorderLeftSize() + viewStyle.GetPaddingLeft() + viewStyle.GetMarginLeft()
+		inputHeaderHeight := titleContentHeight + t.Dialog.Title.GetVerticalFrameSize()
+		if compactLayout {
+			inputHeaderHeight = 0
+			if compactHeader != "" {
+				inputHeaderHeight = lipgloss.Height(compactHeader)
+			}
+		}
+		cursor.X += viewStyle.GetBorderLeftSize() + viewStyle.GetPaddingLeft() + viewStyle.GetMarginLeft() + goalInputPadding
 		cursor.Y += viewStyle.GetBorderTopSize() + viewStyle.GetPaddingTop() + viewStyle.GetMarginTop() +
-			t.Dialog.Title.GetVerticalFrameSize() + titleContentHeight
-		if cursor.X < 0 || cursor.X >= viewWidth || cursor.Y < 0 || cursor.Y >= viewHeight || viewHeight > area.Dy() {
+			inputHeaderHeight + inputPaddingTop
+		if cursor.X < 0 || cursor.X >= viewWidth || cursor.Y < 0 || cursor.Y >= viewHeight {
 			cursor = nil
 		}
 	}
-	DrawCenterCursor(scr, area, view, cursor)
+	return view, cursor
+}
+
+// Draw implements Dialog.
+func (d *Goal) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	width := max(0, min(defaultDialogMaxWidth, area.Dx()-2))
+	maxDialogHeight := max(0, area.Dy()/2)
+	drawArea := area
+	if maxDialogHeight < area.Dy() {
+		drawArea.Min.Y += (area.Dy() - maxDialogHeight) / 2
+		drawArea.Max.Y = drawArea.Min.Y + maxDialogHeight
+	}
+
+	view, cursor := d.renderView(width, maxDialogHeight)
+	if cursor != nil {
+		viewWidth, viewHeight := lipgloss.Size(view)
+		if cursor.X >= min(viewWidth, drawArea.Dx()) || cursor.Y >= min(viewHeight, drawArea.Dy()) {
+			cursor = nil
+		}
+	}
+	DrawCenterCursor(scr, drawArea, view, cursor)
 	return cursor
 }
