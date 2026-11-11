@@ -9,7 +9,7 @@ import (
 // drives both mux registration and the documentation served under
 // /v1/docs/. Add or change an endpoint here, never by hand elsewhere.
 func (c *controllerV1) endpoints() []apigen.Endpoint {
-	return []apigen.Endpoint{
+	endpoints := []apigen.Endpoint{
 		apigen.Get("/v1/health").
 			Summary("Health check").
 			Tags("system").
@@ -778,4 +778,5 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 			Fails(400, 404, 500).
 			Handle(c.handlePostWorkspaceSetSkillConfigDisabled),
 	}
+	return append(endpoints, c.goalEndpoints()...)
 }

@@ -42,6 +42,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -94,6 +95,7 @@ type SessionAgentCall struct {
 	RunID             string
 	Channel           string
 	HiddenUserMessage bool
+	GoalMarker        goal.CallMarker
 	// QueueOnly delivers the call only into an active turn; on an idle
 	// session Run returns ErrSessionIdle instead of starting one.
 	QueueOnly bool
@@ -227,6 +229,37 @@ type Model struct {
 // the explicit Del and the function return.
 type activeCancel struct {
 	cancel context.CancelFunc
+
+	goalMu        sync.Mutex
+	goalToken     goal.Token
+	hasGoalToken  bool
+	goalTicket    goal.Ticket
+	hasGoalTicket bool
+}
+
+func (a *activeCancel) setGoalToken(token goal.Token) {
+	a.goalMu.Lock()
+	a.goalToken = token
+	a.hasGoalToken = true
+	if a.hasGoalTicket && a.goalTicket.Token != token {
+		a.hasGoalTicket = false
+	}
+	a.goalMu.Unlock()
+}
+
+func (a *activeCancel) setGoalTicket(ticket goal.Ticket) {
+	a.goalMu.Lock()
+	a.goalTicket = ticket
+	a.hasGoalTicket = true
+	a.goalToken = ticket.Token
+	a.hasGoalToken = true
+	a.goalMu.Unlock()
+}
+
+func (a *activeCancel) goalState() (goal.Token, bool, goal.Ticket, bool) {
+	a.goalMu.Lock()
+	defer a.goalMu.Unlock()
+	return a.goalToken, a.hasGoalToken, a.goalTicket, a.hasGoalTicket
 }
 
 type sessionAgent struct {
@@ -294,6 +327,18 @@ type sessionAgent struct {
 	// across the agent. Cancel uses its current value as the per-session
 	// high-water mark.
 	acceptSeqGen uint64
+
+	goal              *goal.Service
+	goalWorkspaceID   string
+	goalWake          func(goal.Token)
+	goalWakeAdmission func(string, uint64, goal.Token, func() bool) bool
+	goalPendingWake   map[string]goal.Token
+	// acceptedGoalTargets records the goal token or ticket seen at acceptance
+	// so a Cancel before Run admission can target the same revision. Guarded
+	// by acceptedMu.
+	acceptedGoalTargets map[string]goalCancelTarget
+	goalRunSeqMu        sync.Mutex
+	goalRunSeq          map[string]uint64
 }
 
 type SessionAgentOptions struct {
@@ -312,7 +357,11 @@ type SessionAgentOptions struct {
 	Notify               pubsub.Publisher[notify.Notification]
 	RunComplete          pubsub.Publisher[notify.RunComplete]
 	// Hooks runs lifecycle hooks for turns and compaction. Nil runs none.
-	Hooks *hooks.Runner
+	Hooks             *hooks.Runner
+	Goal              *goal.Service
+	GoalWorkspaceID   string
+	GoalWake          func(goal.Token)
+	GoalWakeAdmission func(string, uint64, goal.Token, func() bool) bool
 	// titles is shared by a coordinator's agents so one drain covers all.
 	titles *titleTracker
 }
@@ -341,6 +390,13 @@ func NewSessionAgent(
 		dispatchMu:           csync.NewMap[string, *sync.Mutex](),
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
+		goal:                 opts.Goal,
+		goalWorkspaceID:      opts.GoalWorkspaceID,
+		goalWake:             opts.GoalWake,
+		goalWakeAdmission:    opts.GoalWakeAdmission,
+		goalPendingWake:      make(map[string]goal.Token),
+		acceptedGoalTargets:  make(map[string]goalCancelTarget),
+		goalRunSeq:           make(map[string]uint64),
 	}
 }
 
@@ -386,11 +442,37 @@ func (r *AcceptedRun) SessionID() string {
 // a handle whose Close is the only way to decrement it. It is the only
 // entry point that mutates acceptedRuns.
 func (a *sessionAgent) BeginAccepted(sessionID string) *AcceptedRun {
+	mu := a.sessionMu(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+	return a.beginAcceptedLocked(sessionID)
+}
+
+// beginAcceptedLocked reserves a run while the caller holds sessionMu. This
+// orders acceptance against the goal follow-up idle-admission check.
+func (a *sessionAgent) beginAcceptedLocked(sessionID string) *AcceptedRun {
+	return a.beginAcceptedCallLocked(sessionID, goal.CallMarker{})
+}
+
+func (a *sessionAgent) beginAcceptedCallLocked(sessionID string, marker goal.CallMarker) *AcceptedRun {
 	a.acceptedMu.Lock()
 	defer a.acceptedMu.Unlock()
+	goalState := a.goalCancelState(SessionAgentCall{SessionID: sessionID, GoalMarker: marker})
+	token, hasGoalToken, ticket, hasGoalTicket := goalState.goalState()
 	count, _ := a.acceptedRuns.Get(sessionID)
 	a.acceptedRuns.Set(sessionID, count+1)
 	a.acceptSeqGen++
+	if hasGoalToken || hasGoalTicket {
+		if a.acceptedGoalTargets == nil {
+			a.acceptedGoalTargets = make(map[string]goalCancelTarget)
+		}
+		a.acceptedGoalTargets[sessionID] = goalCancelTarget{
+			token:     token,
+			hasToken:  hasGoalToken,
+			ticket:    ticket,
+			hasTicket: hasGoalTicket,
+		}
+	}
 	return &AcceptedRun{agent: a, sessionID: sessionID, seq: a.acceptSeqGen}
 }
 
@@ -409,14 +491,21 @@ func (a *sessionAgent) BeginAccepted(sessionID string) *AcceptedRun {
 // from under a covered handle still waiting to enter Run.
 func (a *sessionAgent) endAccepted(sessionID string) {
 	a.acceptedMu.Lock()
-	defer a.acceptedMu.Unlock()
 	count, ok := a.acceptedRuns.Get(sessionID)
 	if !ok || count <= 1 {
 		a.acceptedRuns.Del(sessionID)
 		a.cancelMark.Del(sessionID)
+		delete(a.acceptedGoalTargets, sessionID)
+		token, hasWake := a.goalPendingWake[sessionID]
+		delete(a.goalPendingWake, sessionID)
+		a.acceptedMu.Unlock()
+		if hasWake {
+			a.emitGoalWake(token)
+		}
 		return
 	}
 	a.acceptedRuns.Set(sessionID, count-1)
+	a.acceptedMu.Unlock()
 }
 
 // sessionMu returns the per-session dispatch mutex, creating it on first
@@ -499,6 +588,10 @@ func (a *sessionAgent) drainQueueForStep(sessionID string) (fold, canceled []Ses
 	queuedCalls, _ := a.messageQueue.Get(sessionID)
 	var keep []SessionAgentCall
 	for _, queued := range queuedCalls {
+		if queued.GoalMarker.Kind == goal.CallInitial && !a.goalInitialPending(queued) {
+			canceled = append(canceled, queued)
+			continue
+		}
 		if a.canceledBySeq(sessionID, queued.acceptSeq) {
 			canceled = append(canceled, queued)
 			continue
@@ -506,6 +599,9 @@ func (a *sessionAgent) drainQueueForStep(sessionID string) (fold, canceled []Ses
 		if queued.RunID != "" {
 			keep = append(keep, queued)
 			continue
+		}
+		if queued.Report == nil {
+			a.resumeGoalForCall(queued)
 		}
 		fold = append(fold, queued)
 	}
@@ -535,6 +631,7 @@ func (a *sessionAgent) settleDroppedCalls(drops []SessionAgentCall) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, d := range drops {
+		a.cancelDroppedGoalInitial(d)
 		if d.Report != nil {
 			if _, err := a.createUserMessage(ctx, d, ""); err != nil {
 				slog.Error("Failed to record a dropped subagent report", "session_id", d.SessionID, "error", err)
@@ -719,6 +816,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	if err := ValidateCall(call); err != nil {
 		return nil, err
 	}
+	call.HiddenUserMessage = goalCallHidden(call.GoalMarker, call.HiddenUserMessage)
 
 	if call.Channel != "" && call.channelMeta == nil {
 		call.channelMeta, _ = parseChannelMeta(call.Prompt)
@@ -728,10 +826,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// the per-session dispatch mutex below so a concurrent Cancel can observe
 	// the activeRequests entry before the assistant message exists.
 	var (
-		genCtx         context.Context
-		cancel         context.CancelFunc
-		userMsgCreated bool
+		genCtx            context.Context
+		cancel            context.CancelFunc
+		ac                *activeCancel
+		userMsgCreated    bool
+		currentAssistant  *message.Message
+		answeredToolCalls = csync.NewMap[string, struct{}]()
 	)
+	var lifecycle *goalRunState
+	if !a.isSubAgent && a.goal != nil {
+		lifecycle = &goalRunState{}
+		if call.GoalMarker.Kind == goal.CallInitial {
+			ticket := call.GoalMarker.Ticket
+			lifecycle.initialTicket = &ticket
+		}
+	}
 
 	// Serialize the dispatch decision (cancel-on-entry | queued | active)
 	// against a concurrent Cancel. Cancel takes the same per-session lock, so
@@ -743,6 +852,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// and start two runs on the same session.
 	sessMu := a.sessionMu(call.SessionID)
 	sessMu.Lock()
+
+	if call.GoalMarker.Kind == goal.CallInitial && !a.goalInitialPending(call) {
+		return a.skipStaleGoalInitialLocked(ctx, call, sessMu)
+	}
 
 	if call.Accepted != nil && a.canceledBySeq(call.SessionID, call.Accepted.seq) {
 		// Cancel-on-entry: a cancel arrived while this accepted run was
@@ -758,6 +871,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		// `crush run`, which ignores message events and blocks on
 		// RunComplete) would hang on an immediately-canceled accepted run.
 		call.Accepted.Close()
+		a.cancelDroppedGoalInitial(call)
 		sessMu.Unlock()
 		complete := notify.RunComplete{
 			SessionID: call.SessionID,
@@ -773,18 +887,36 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, nil
 	}
 
-	if a.IsSessionBusy(call.SessionID) {
-		// Busy: an earlier prompt is active. Queue this call so it is
-		// folded into (or sequenced after) the active turn, and release any
-		// accept reservation. A Cancel arriving after this point sees the
-		// active entry and clears the queue.
-		//
-		// enqueueCall strips OnComplete: the caller that supplied the hook
-		// (typically coordinator.Run) has its own retry/coalesce scope that
-		// ends when it returns, so by the time the queue drains nobody is
-		// left to consume the buffered terminal event. The queued turn falls
-		// back to the default broker publish, which is what existing
-		// subscribers expect.
+	// Idle: become the active run. Register the cancel func before dropping
+	// the lock so a Cancel that arrives between here and assistant creation
+	// is not lost. Fresh goal follow-ups perform this same registration from
+	// inside Goal.AdmitWake so cancellation cannot slip between validation
+	// and dispatch.
+	registerActive := func() {
+		runCtx := context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
+		genCtx, cancel = context.WithCancel(runCtx)
+		ac = a.goalCancelState(call)
+		ac.cancel = cancel
+		a.activeRequests.Set(call.SessionID, ac)
+		if lifecycle != nil {
+			lifecycle.generation = a.nextGoalRunGeneration(call.SessionID)
+			if token, ok := a.goalTokenForStep(call, nil); ok {
+				lifecycle.token = token
+				lifecycle.hasToken = true
+			}
+		}
+		a.resumeGoalForCall(call)
+	}
+	if call.GoalMarker.Kind == goal.CallFollowup {
+		if !a.admitGoalFollowupLocked(call, registerActive) {
+			if call.Accepted != nil {
+				call.Accepted.Close()
+			}
+			sessMu.Unlock()
+			return nil, nil
+		}
+	} else if a.IsSessionBusy(call.SessionID) {
+		// A non-goal prompt arriving while another turn is active is queued.
 		a.enqueueCall(call)
 		if call.Accepted != nil {
 			call.Accepted.Close()
@@ -801,18 +933,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, ErrSessionIdle
 	}
 
-	// Idle: become the active run. Register the cancel func before dropping
-	// the lock so a Cancel that arrives between here and assistant creation
-	// is not lost.
-	runCtx := context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
-	genCtx, cancel = context.WithCancel(runCtx)
-	ac := &activeCancel{cancel: cancel}
-	a.activeRequests.Set(call.SessionID, ac)
+	if genCtx == nil {
+		registerActive()
+	}
 	if call.Accepted != nil {
 		call.Accepted.Close()
 	}
 	sessMu.Unlock()
 
+	if lifecycle != nil {
+		defer func() {
+			a.finishGoalRun(call.SessionID, lifecycle, result, retErr, currentAssistant, answeredToolCalls)
+		}()
+	}
 	defer cancel()
 	// Conditional cleanup: only remove our entry if it hasn't been replaced
 	// by a newer run. Without this guard, the deferred Del fires after a
@@ -826,12 +959,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// RunComplete (each queued user prompt is its own turn and
 	// publishes exactly one terminal event).
 	var skipRunComplete bool
-	// currentAssistant is declared here so the deferred RunComplete
-	// publish below can capture the pointer that PrepareStep will
-	// later (re)assign for each streaming step. The final assistant
-	// message of the turn is the value reachable through this
-	// pointer when the defer runs.
-	var currentAssistant *message.Message
+	// currentAssistant is declared before dispatch so terminal cleanup can
+	// capture the final assistant record.
 	// Drain any debounced message updates before returning. message.Service
 	// already flushes synchronously on terminal updates, but a defer here
 	// guarantees the contract at every Run exit (success, error, panic
@@ -942,6 +1071,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, err
 	}
 	userMsgCreated = true
+	if call.GoalMarker.Kind == goal.CallInitial && !a.goalInitialPending(call) {
+		return nil, nil
+	}
 
 	// Add the session to the context. The run context (genCtx) and its
 	// cancel func were already created and registered under the dispatch
@@ -956,6 +1088,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 
 	var stepMessages []fantasy.Message
 	var shouldSummarize bool
+	var callDelivery, foldedDelivery, stepDelivery *goalDelivery
 	// Written from OnToolCall and read from OnToolResult, which fantasy
 	// invokes concurrently for parallel tool calls.
 	sanitizedToolCalls := csync.NewMap[string, bool]()
@@ -966,7 +1099,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// originating channel.
 	completedToolCalls := csync.NewMap[string, struct{}]()
 	// Calls that got a reply this turn; the rest are settled when it ends.
-	answeredToolCalls := csync.NewMap[string, struct{}]()
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
 	var maxOutputTokens *int64
 	if call.MaxOutputTokens > 0 {
@@ -998,6 +1130,20 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				filterToolsForChannel(a.tools.Copy(), call.Channel, mcp.GetStates()),
 			)
 
+			stepDelivery = nil
+			foldedInitialIndex := -1
+			if call.GoalMarker.Kind == goal.CallInitial {
+				if callDelivery == nil {
+					callDelivery = newGoalDelivery(a.goal, call.GoalMarker.Ticket)
+				}
+				if !a.goalInitialMayContinue(call, callDelivery) {
+					return callContext, prepared, errGoalDeliveryRevoked
+				}
+				if !callDelivery.started() {
+					stepDelivery = callDelivery
+				}
+			}
+
 			// Drain queued follow-up prompts for this step. Calls covered
 			// by a cancel recorded while they sat in the queue are dropped:
 			// a cancel that arrived after a prompt was queued must not let
@@ -1012,11 +1158,62 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			fold, canceled := a.drainQueueForStep(call.SessionID)
 			a.settleDroppedCalls(canceled)
 			for _, queued := range fold {
+				var queuedDelivery *goalDelivery
+				if queued.GoalMarker.Kind == goal.CallInitial {
+					if !a.goalInitialPending(queued) {
+						continue
+					}
+					if foldedDelivery == nil || foldedDelivery.ticket.Token != queued.GoalMarker.Ticket.Token {
+						foldedDelivery = newGoalDelivery(a.goal, queued.GoalMarker.Ticket)
+					}
+					if lifecycle != nil && (lifecycle.initialTicket == nil || lifecycle.initialTicket.Token != queued.GoalMarker.Ticket.Token) {
+						ticket := queued.GoalMarker.Ticket
+						lifecycle.initialTicket = &ticket
+						lifecycle.activated = false
+					}
+					queuedDelivery = foldedDelivery
+				}
 				userMessage, createErr := a.createUserMessage(callContext, queued, "")
 				if createErr != nil {
 					return callContext, prepared, createErr
 				}
-				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
+				if queuedDelivery != nil && !a.goal.IsPending(queuedDelivery.ticket) {
+					continue
+				}
+				aiMessages := userMessage.ToAIMessage()
+				if queuedDelivery != nil && foldedInitialIndex == -1 {
+					foldedInitialIndex = len(prepared.Messages)
+				}
+				prepared.Messages = append(prepared.Messages, aiMessages...)
+				if queuedDelivery != nil && !queuedDelivery.started() {
+					stepDelivery = queuedDelivery
+				}
+			}
+			if foldedDelivery != nil && foldedInitialIndex >= 0 && foldedInitialIndex < len(prepared.Messages) {
+				foldedMessage := prepared.Messages[foldedInitialIndex]
+				matchesAfter := 0
+				for i := foldedInitialIndex + 1; i < len(prepared.Messages); i++ {
+					if sameGoalPromptMessage(prepared.Messages[i], foldedMessage) {
+						matchesAfter++
+					}
+				}
+				foldedDelivery.setFoldedMessage(foldedMessage, matchesAfter)
+			}
+
+			if token, ok := a.goalTokenForStep(call, foldedDelivery); ok {
+				// complete_goal checks that this exact token is active. For an
+				// initial delivery, ModelProvider activates it before Fantasy
+				// consumes the returned stream or runs a tool.
+				callContext = goal.WithTrustedToken(callContext, token)
+				if foldedDelivery != nil && foldedDelivery.hasFoldedMessage() && foldedDelivery.ticket.Token == token {
+					ac.setGoalTicket(foldedDelivery.ticket)
+				} else {
+					ac.setGoalToken(token)
+				}
+				if lifecycle != nil {
+					lifecycle.token = token
+					lifecycle.hasToken = true
+				}
 			}
 
 			prepared.Messages = dropEmptyToolMedia(prepared.Messages)
@@ -1131,7 +1328,24 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			slog.Info("ModelProvider called",
 				"provider", largeModel.ModelCfg.Provider,
 				"model", largeModel.ModelCfg.Model)
-			return a.currentBuildOf(largeModel)
+			if lifecycle != nil {
+				lifecycle.dispatched = true
+			}
+			model := a.currentBuildOf(largeModel)
+			if stepDelivery != nil {
+				delivery := stepDelivery
+				return goalDeliveryModel{
+					LanguageModel: model,
+					delivery:      delivery,
+					enabled:       a.goalToolEnabled,
+					onStarted: func(activated bool) {
+						if lifecycle != nil {
+							lifecycle.activated = lifecycle.activated || activated
+						}
+					},
+				}
+			}
+			return model
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
@@ -1172,6 +1386,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			})
 			if createMsgErr == nil {
 				answeredToolCalls.Set(result.ToolCallID, struct{}{})
+			}
+			if result.StopTurn && lifecycle != nil {
+				lifecycle.stopTurn.Store(true)
 			}
 			return createMsgErr
 		},
@@ -1240,13 +1457,28 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		},
 	})
 
-	a.eventPromptResponded(call.SessionID, time.Since(startTime).Truncate(time.Second))
+	deliveryRevoked := isGoalDeliveryRevoked(err)
+	if deliveryRevoked {
+		result = nil
+		err = nil
+		if lifecycle != nil {
+			lifecycle.suppressed = true
+		}
+	} else {
+		a.eventPromptResponded(call.SessionID, time.Since(startTime).Truncate(time.Second))
+	}
 
 	// Final writes use a context detached from the run: workspace shutdown
 	// cancels ctx before agent goroutines finish, and the turn's ending
 	// must still land.
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cleanupCancel()
+	if deliveryRevoked && currentAssistant != nil {
+		if deleteErr := a.messages.Delete(cleanupCtx, currentAssistant.ID); deleteErr != nil {
+			slog.Error("Failed to remove an assistant message for a revoked goal delivery", "error", deleteErr)
+		}
+		currentAssistant = nil
+	}
 	if currentAssistant != nil {
 		answered := func(id string) bool {
 			_, ok := answeredToolCalls.Get(id)
@@ -1340,21 +1572,45 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	continued := false
 	if shouldSummarize {
 		a.activeRequests.Del(call.SessionID)
-		summarizeErr := a.summarize(genCtx, call.SessionID, compactTriggerAuto, call.ProviderOptions, call.OnAuthRefresh)
+		summaryCtx := genCtx
+		if lifecycle != nil && lifecycle.hasToken {
+			summaryCtx = goal.WithTrustedToken(summaryCtx, lifecycle.token)
+		}
+		summarizeErr := a.summarize(summaryCtx, call.SessionID, compactTriggerAuto, call.ProviderOptions, call.OnAuthRefresh)
 		switch {
 		case errors.Is(summarizeErr, ErrCompactionBlocked):
+			if lifecycle != nil {
+				lifecycle.summaryFailed = true
+			}
 			// Uncompacted, the next step would only hit the limit
 			// again, so the turn ends here.
 			slog.Info("PreCompact hook blocked compaction", "session_id", call.SessionID)
 		case summarizeErr != nil:
+			if lifecycle != nil {
+				lifecycle.summaryFailed = true
+			}
 			return nil, summarizeErr
 		case len(currentAssistant.ToolCalls()) > 0:
 			existing, _ := a.messageQueue.Get(call.SessionID)
 			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
 			// The rewritten prompt is a new message, not the report.
 			call.Report = nil
+			goalChain := call.GoalMarker.Kind != goal.CallOrdinary || lifecycle != nil && lifecycle.hasToken
+			var continuationToken goal.Token
+			if lifecycle != nil && lifecycle.hasToken {
+				continuationToken = lifecycle.token
+			} else if call.GoalMarker.Kind == goal.CallInitial {
+				continuationToken = call.GoalMarker.Ticket.Token
+			} else {
+				continuationToken = call.GoalMarker.Token
+			}
+			call.GoalMarker = goal.CallMarker{Kind: goal.CallContinuation, Token: continuationToken}
+			call.HiddenUserMessage = call.HiddenUserMessage || goalChain
 			a.messageQueue.Set(call.SessionID, append(existing, call))
 			continued = true
+			if lifecycle != nil {
+				lifecycle.continued = true
+			}
 		}
 	}
 	finished := currentAssistant != nil && !continued
@@ -1404,6 +1660,19 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	mu := a.sessionMu(call.SessionID)
 	mu.Lock()
 	queuedMessages, _ := a.messageQueue.Get(call.SessionID)
+	var staleGoalInitials []SessionAgentCall
+	if len(queuedMessages) > 0 {
+		kept := make([]SessionAgentCall, 0, len(queuedMessages))
+		for _, queued := range queuedMessages {
+			if queued.GoalMarker.Kind == goal.CallInitial && !a.goalInitialPending(queued) {
+				staleGoalInitials = append(staleGoalInitials, queued)
+				continue
+			}
+			kept = append(kept, queued)
+		}
+		queuedMessages = kept
+		a.messageQueue.Set(call.SessionID, kept)
+	}
 	if mark, ok := a.cancelMark.Get(call.SessionID); ok && mark > 0 && len(queuedMessages) > 0 {
 		// A cancel was recorded for this session (e.g. it arrived while
 		// this run was active and follow-ups had been queued). Drop the
@@ -1437,6 +1706,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			a.cancelMark.Del(call.SessionID)
 		}
 		mu.Unlock()
+		a.settleDroppedCalls(staleGoalInitials)
 		return result, err
 	}
 	// There are queued messages, restart the loop. Suppress the outer
@@ -1444,6 +1714,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// (named-return clobbering through the return below) against this
 	// turn's MessageID/Text and publish a mixed, racing event.
 	skipRunComplete = true
+	if lifecycle != nil {
+		lifecycle.handedOff = true
+	}
 	// Decide whether this turn still owes its own terminal RunComplete.
 	// Each submitted prompt with a RunID has its own lifecycle, so a turn
 	// that is finished and handing off to a *different* queued prompt must
@@ -1470,8 +1743,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// Run registering its activeRequests entry: a cancel arriving in
 	// that window now records a pending cancel (acceptedRuns > 0) that
 	// the recursive Run's accepted path observes as cancel-on-entry.
-	firstQueuedMessage.Accepted = a.BeginAccepted(call.SessionID)
+	firstQueuedMessage.Accepted = a.beginAcceptedCallLocked(call.SessionID, firstQueuedMessage.GoalMarker)
 	mu.Unlock()
+	a.settleDroppedCalls(staleGoalInitials)
 	if outerOwesRunComplete {
 		complete := notify.RunComplete{SessionID: call.SessionID, RunID: call.RunID}
 		if currentAssistant != nil {
@@ -1496,6 +1770,15 @@ func (a *sessionAgent) summarize(ctx context.Context, sessionID, trigger string,
 	if a.IsSessionBusy(sessionID) {
 		return ErrSessionBusy
 	}
+	if !a.isSubAgent && a.goal != nil {
+		if _, ok := goal.TrustedTokenFromContext(ctx); !ok {
+			snapshot := a.goal.Get()
+			if snapshot.Active && snapshot.WorkspaceID == a.goalWorkspaceID && snapshot.SessionID == sessionID {
+				ctx = goal.WithTrustedToken(ctx, goalTokenForSnapshot(snapshot))
+			}
+		}
+	}
+	summaryGoalGeneration := a.currentGoalRunGeneration(sessionID)
 
 	largeModel := a.models().Large
 	systemPromptPrefix := a.systemPromptPrefix.Get()
@@ -1514,13 +1797,18 @@ func (a *sessionAgent) summarize(ctx context.Context, sessionID, trigger string,
 	}
 
 	if pre := a.hooks.Run(ctx, hooks.Event{Name: hooks.EventPreCompact, SessionID: sessionID, Trigger: trigger}); pre.Blocked() {
+		a.pauseGoalFromContextForGeneration(ctx, sessionID, summaryGoalGeneration)
 		return fmt.Errorf("%w: %s", ErrCompactionBlocked, pre.Reason)
 	}
 
 	aiMsgs, _ := a.preparePrompt(msgs, largeModel.CatwalkCfg.Capabilities.Vision, largeModel.CatwalkCfg.Capabilities.Audio)
 
 	genCtx, cancel := context.WithCancel(ctx)
-	ac := &activeCancel{cancel: cancel}
+	ac := a.goalCancelState(SessionAgentCall{SessionID: sessionID})
+	if token, ok := goal.TrustedTokenFromContext(ctx); ok {
+		ac.setGoalToken(token)
+	}
+	ac.cancel = cancel
 	a.activeRequests.Set(sessionID, ac)
 	defer a.activeRequests.CompareAndDelete(sessionID, ac)
 	defer cancel()
@@ -1584,6 +1872,7 @@ func (a *sessionAgent) summarize(ctx context.Context, sessionID, trigger string,
 		},
 	})
 	if err != nil {
+		a.pauseGoalFromContextForGeneration(ctx, sessionID, summaryGoalGeneration)
 		isCancelErr := errors.Is(err, context.Canceled)
 		if isCancelErr {
 			// User cancelled summarize we need to remove the summary message.
@@ -1597,6 +1886,9 @@ func (a *sessionAgent) summarize(ctx context.Context, sessionID, trigger string,
 			return updateErr
 		}
 		return err
+	}
+	if resp != nil && (len(resp.Steps) == 0 || resp.Steps[len(resp.Steps)-1].FinishReason != fantasy.FinishReasonStop) {
+		a.pauseGoalFromContextForGeneration(ctx, sessionID, summaryGoalGeneration)
 	}
 
 	var overrideCost *float64
@@ -2241,20 +2533,9 @@ func (a *sessionAgent) Cancel(sessionID string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Cancel regular requests. Don't use Take() here - we need the entry to
-	// remain in activeRequests so IsBusy() returns true until the goroutine
-	// fully completes (including error handling that may access the DB).
-	// The defer in processRequest will clean up the entry.
-	if ac, ok := a.activeRequests.Get(sessionID); ok && ac != nil {
-		slog.Debug("Request cancellation initiated", "session_id", sessionID)
-		ac.cancel()
-	}
-
-	// Also check for summarize requests.
-	if ac, ok := a.activeRequests.Get(sessionID + "-summarize"); ok && ac != nil {
-		slog.Debug("Summarize cancellation initiated", "session_id", sessionID)
-		ac.cancel()
-	}
+	active, _ := a.activeRequests.Get(sessionID)
+	summarize, _ := a.activeRequests.Get(sessionID + "-summarize")
+	queuedCount := a.QueuedPrompts(sessionID)
 
 	// Record a pending cancel only when a dispatched-but-not-yet-active
 	// run exists. This catches runs still in the goroutine scheduler or
@@ -2273,7 +2554,43 @@ func (a *sessionAgent) Cancel(sessionID string) {
 	a.acceptedMu.Lock()
 	count, ok := a.acceptedRuns.Get(sessionID)
 	mark := a.acceptSeqGen
+	acceptedTarget, hasAcceptedTarget := a.acceptedGoalTargets[sessionID]
+	actualCancel := active != nil || summarize != nil || queuedCount > 0 || ok && count > 0
+	if actualCancel {
+		delete(a.goalPendingWake, sessionID)
+	}
 	a.acceptedMu.Unlock()
+	if active != nil {
+		a.pauseGoalForCancel(sessionID, active)
+	}
+	if summarize != nil {
+		a.pauseGoalForCancel(sessionID, summarize)
+	}
+	if ok && count > 0 && hasAcceptedTarget {
+		acceptedGoal := &activeCancel{}
+		if acceptedTarget.hasTicket {
+			acceptedGoal.setGoalTicket(acceptedTarget.ticket)
+		} else if acceptedTarget.hasToken {
+			acceptedGoal.setGoalToken(acceptedTarget.token)
+		}
+		a.pauseGoalForCancel(sessionID, acceptedGoal)
+	}
+
+	// Cancel regular requests. Don't use Take() here - we need the entry to
+	// remain in activeRequests so IsBusy() returns true until the goroutine
+	// fully completes (including error handling that may access the DB).
+	// The defer in processRequest will clean up the entry.
+	if active != nil {
+		slog.Debug("Request cancellation initiated", "session_id", sessionID)
+		active.cancel()
+	}
+
+	// Also cancel summarize requests.
+	if summarize != nil {
+		slog.Debug("Summarize cancellation initiated", "session_id", sessionID)
+		summarize.cancel()
+	}
+
 	if ok && count > 0 {
 		slog.Debug("Recording cancel mark for accepted runs", "session_id", sessionID, "count", count, "mark", mark)
 		existing, _ := a.cancelMark.Get(sessionID)

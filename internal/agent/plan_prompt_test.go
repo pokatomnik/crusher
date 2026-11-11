@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +41,7 @@ func TestPlanPromptListsConfiguredTools(t *testing.T) {
 	// that decides which tools are attached.
 	buildPrompt := func(t *testing.T, interactive bool) string {
 		t.Helper()
-		c := &coordinator{interactive: interactive}
+		c := &coordinator{interactive: interactive, cfg: cfg, goal: goal.NewService(), goalWorkspaceID: "workspace"}
 		planCfg := cfg.Config().Agents[config.AgentPlan]
 		p, err := planPrompt(
 			prompt.WithWorkingDir(env.workingDir),
@@ -55,12 +56,12 @@ func TestPlanPromptListsConfiguredTools(t *testing.T) {
 	// Interactive: subagents report back on their own, so the detached
 	// pair is advertised and the blocking tool is not.
 	require.Contains(t, buildPrompt(t, true),
-		"Your available tools are: agent_dispatch, agent_send, agent_status, agent_stop, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, question, sourcegraph, view.")
+		"Your available tools are: agent_dispatch, agent_send, agent_status, agent_stop, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, question, sourcegraph, view, complete_goal.")
 
 	// Headless: nothing is left to receive a later report, so delegation
 	// blocks instead, and there is nobody to answer a question.
 	require.Contains(t, buildPrompt(t, false),
-		"Your available tools are: agent, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, sourcegraph, view.")
+		"Your available tools are: agent, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, sourcegraph, view, complete_goal.")
 
 	// A tool the user disabled disappears from the advertised list.
 	// (The word "question" still appears elsewhere in the prompt's rules,
@@ -69,6 +70,11 @@ func TestPlanPromptListsConfiguredTools(t *testing.T) {
 	cfg.SetupAgents()
 	systemPrompt := buildPrompt(t, true)
 	require.Contains(t, systemPrompt,
-		"Your available tools are: agent_dispatch, agent_send, agent_status, agent_stop, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, sourcegraph, view.")
+		"Your available tools are: agent_dispatch, agent_send, agent_status, agent_stop, lsp_symbols, lsp_definition, lsp_call_hierarchy, glob, grep, ls, sourcegraph, view, complete_goal.")
 	require.NotContains(t, systemPrompt, "ls, question,")
+
+	cfg.Config().Options.DisabledTools = []string{"complete_goal"}
+	cfg.SetupAgents()
+	systemPrompt = buildPrompt(t, true)
+	require.NotContains(t, systemPrompt, "complete_goal")
 }

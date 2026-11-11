@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/herdr"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/log"
@@ -43,9 +44,11 @@ import (
 type ClientWorkspace struct {
 	client *client.Client
 
-	mu     sync.RWMutex
-	ws     proto.Workspace
-	skills *skills.Manager
+	mu                    sync.RWMutex
+	ws                    proto.Workspace
+	goalSnapshot          goal.Snapshot
+	goalRuntimeGeneration uint64
+	skills                *skills.Manager
 	// lastSession is the most recent session ID reported via
 	// SetCurrentSession. The subscription loop re-asserts it after a
 	// reconnect, because the server's per-client presence entry (or the
@@ -94,23 +97,24 @@ func NewClientWorkspace(c *client.Client, ws proto.Workspace) *ClientWorkspace {
 	mgr := skills.NewManager(nil, nil, states, skills.WithGlobalMirror())
 	subCtx, subCancel := context.WithCancel(context.Background())
 	return &ClientWorkspace{
-		client:      c,
-		ws:          ws,
-		skills:      mgr,
-		subCtx:      subCtx,
-		subCancel:   subCancel,
-		subDone:     make(chan struct{}),
-		herdrClient: herdr.Init(),
+		client:                c,
+		ws:                    ws,
+		goalRuntimeGeneration: 1,
+		skills:                mgr,
+		subCtx:                subCtx,
+		subCancel:             subCancel,
+		subDone:               make(chan struct{}),
+		herdrClient:           herdr.Init(),
 	}
 }
 
 // refreshWorkspace re-fetches the workspace from the server, updating
 // the cached snapshot. Called after config-mutating operations.
-func (w *ClientWorkspace) refreshWorkspace() {
+func (w *ClientWorkspace) refreshWorkspace() bool {
 	updated, err := w.client.GetWorkspace(context.Background(), w.workspaceID())
 	if err != nil {
 		slog.Error("Failed to refresh workspace", "error", err)
-		return
+		return false
 	}
 	if updated.Config != nil {
 		updated.Config.SetupAgents()
@@ -119,6 +123,7 @@ func (w *ClientWorkspace) refreshWorkspace() {
 	w.mu.Lock()
 	w.ws = *updated
 	w.mu.Unlock()
+	return true
 }
 
 // cached returns a snapshot of the cached workspace.
@@ -1021,6 +1026,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 			w.afterReconnect(send)
 		}
 		backoff = sseReconnectInitialBackoff
+		w.resyncGoal(send)
 		w.consumeEvents(evc, send)
 
 		// The event channel closed: the server restarted, the stream was
@@ -1072,6 +1078,11 @@ func (w *ClientWorkspace) recoverWorkspace() error {
 	w.mu.Lock()
 	oldID := w.ws.ID
 	w.ws = *created
+	w.goalRuntimeGeneration++
+	if w.goalRuntimeGeneration == 0 {
+		w.goalRuntimeGeneration++
+	}
+	w.goalSnapshot = goal.Snapshot{}
 	w.mu.Unlock()
 	slog.Info("Re-registered workspace after server-side loss",
 		"old_id", oldID, "new_id", created.ID)
@@ -1171,7 +1182,9 @@ func (w *ClientWorkspace) consumeEvents(evc <-chan any, send func(tea.Msg)) {
 		}
 
 		if _, ok := ev.(pubsub.Event[proto.ConfigChanged]); ok {
-			w.refreshWorkspace()
+			if w.refreshWorkspace() {
+				w.notifyGoalAvailability(send)
+			}
 			continue
 		}
 		translated := w.translateEvent(ev)
@@ -1415,6 +1428,11 @@ func (w *ClientWorkspace) translateEvent(ev any) tea.Msg {
 			LatestVersion:  e.Payload.LatestVersion,
 			IsDevelopment:  e.Payload.IsDevelopment,
 		}
+	case pubsub.Event[proto.GoalState]:
+		snapshot := goalStateToSnapshot(e.Payload)
+		_, generation := w.goalRuntime()
+		w.cacheGoalSnapshot(generation, snapshot)
+		return pubsub.Event[goal.Snapshot]{Type: e.Type, Payload: snapshot}
 	case pubsub.Event[proto.HostThemeState]:
 		theme := e.Payload.Theme
 		if e.Type == pubsub.DeletedEvent {

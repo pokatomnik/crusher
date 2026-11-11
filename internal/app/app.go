@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/format"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/herdr"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/hooks"
@@ -101,15 +102,37 @@ type App struct {
 	// currentSessionID is the session the user is working in, reported
 	// by the TUI and the non-interactive runner, for SessionEnd.
 	currentSessionID atomic.Value
+
+	goalService     *goal.Service
+	goalWorkspaceID string
+	ownsGoalService bool
+
+	goalRuntimeMu      sync.Mutex
+	goalRuntimeStopped bool
+	goalCtx            context.Context
+	goalCancel         context.CancelFunc
+	goalWake           chan struct{}
+	goalInitialWG      sync.WaitGroup
+	goalWorkerWG       sync.WaitGroup
+	goalEventCancel    context.CancelFunc
+	goalEventWG        sync.WaitGroup
+	goalStopOnce       sync.Once
+	goalEventStopOnce  sync.Once
+	goalCoordinatorGen atomic.Uint64
 }
 
 // New initializes a new application instance. skillsMgr carries the
 // per-workspace skill discovery results computed by the caller; the
 // caller is responsible for constructing it (typically via
 // skills.NewManager + skills.DiscoverFromConfig).
-func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr *skills.Manager) (*App, error) {
+func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr *skills.Manager, goalOptions ...GoalOptions) (*App, error) {
+	goalService, goalWorkspaceID, ownsGoalService, err := resolveGoalOptions(goalOptions)
+	if err != nil {
+		return nil, err
+	}
+
 	q := db.New(conn)
-	sessions := session.NewService(q, conn)
+	sessions := newGoalSessionService(session.NewService(q, conn), goalService, goalWorkspaceID)
 	messages := message.NewService(q)
 	files := history.NewService(q, conn)
 	cfg := store.Config()
@@ -138,8 +161,11 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		LSPManager:  lsp.NewManager(store),
 		Skills:      skillsMgr,
 
-		globalCtx:  ctx,
-		hookRunner: hookRunner,
+		globalCtx:       ctx,
+		hookRunner:      hookRunner,
+		goalService:     goalService,
+		goalWorkspaceID: goalWorkspaceID,
+		ownsGoalService: ownsGoalService,
 
 		config: store,
 
@@ -151,6 +177,10 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 	}
 
 	app.setupEvents()
+	if err := app.startGoalRuntime(); err != nil {
+		app.rollbackGoalRuntime()
+		return nil, fmt.Errorf("failed to initialize goal runtime: %w", err)
+	}
 
 	// Start the pinentry watcher so terminal-based GPG passphrase prompts
 	// (pinentry-curses/pinentry-tty) get exclusive terminal access while a
@@ -248,6 +278,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		return app, nil
 	}
 	if err := app.InitCoderAgent(ctx); err != nil {
+		app.rollbackGoalRuntime()
 		return nil, fmt.Errorf("failed to initialize coder agent: %w", err)
 	}
 	go app.refreshDiscoveredModels(ctx, app.AgentCoordinator)
@@ -538,6 +569,7 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 }
 
 func (app *App) UpdateAgentModel(ctx context.Context) error {
+	app.cancelDisabledGoal()
 	if app.AgentCoordinator == nil {
 		return fmt.Errorf("agent configuration is missing")
 	}
@@ -922,26 +954,37 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	if coderAgentCfg.ID == "" {
 		return fmt.Errorf("coder agent configuration is missing")
 	}
+	generation := app.goalCoordinatorGen.Add(1)
 	var err error
-	app.AgentCoordinator, err = agent.NewCoordinator(ctx, agent.CoordinatorOptions{
-		Config:      app.config,
-		Sessions:    app.Sessions,
-		Messages:    app.Messages,
-		Permissions: app.Permissions,
-		Questions:   app.Questions,
-		History:     app.History,
-		FileTracker: app.FileTracker,
-		LSPManager:  app.LSPManager,
-		Notify:      app.agentNotifications,
-		RunComplete: app.runCompletions,
-		Skills:      app.Skills,
-		HookRunner:  app.hookRunner,
-		Interactive: interactive,
+	coordinator, err := agent.NewCoordinator(ctx, agent.CoordinatorOptions{
+		Config:          app.config,
+		Sessions:        app.Sessions,
+		Messages:        app.Messages,
+		Permissions:     app.Permissions,
+		Questions:       app.Questions,
+		History:         app.History,
+		FileTracker:     app.FileTracker,
+		LSPManager:      app.LSPManager,
+		Notify:          app.agentNotifications,
+		RunComplete:     app.runCompletions,
+		Skills:          app.Skills,
+		HookRunner:      app.hookRunner,
+		Interactive:     interactive,
+		Goal:            app.goalService,
+		GoalWorkspaceID: app.goalWorkspaceID,
+		GoalWake:        app.goalWakeForGeneration(generation),
 	})
 	if err != nil {
 		slog.Error("Failed to create coder agent", "err", err)
+		app.goalRuntimeMu.Lock()
+		app.AgentCoordinator = nil
+		app.goalRuntimeMu.Unlock()
 		return err
 	}
+	app.goalRuntimeMu.Lock()
+	app.AgentCoordinator = coordinator
+	app.goalRuntimeMu.Unlock()
+	app.signalGoalWorker()
 	return nil
 }
 
@@ -983,10 +1026,17 @@ func (app *App) Shutdown() {
 	start := time.Now()
 	defer func() { slog.Debug("Shutdown took " + time.Since(start).String()) }()
 
+	app.StopGoalRuntime()
+
 	// First, cancel all agents and wait for them to finish. This must complete
 	// before closing the DB so agents can finish writing their state.
 	if app.AgentCoordinator != nil {
 		app.AgentCoordinator.CancelAll()
+	}
+	app.waitGoalRuntime()
+	app.stopGoalEventFanIn()
+	if app.ownsGoalService && app.goalService != nil {
+		app.goalService.Shutdown()
 	}
 	app.fireSessionEnd()
 

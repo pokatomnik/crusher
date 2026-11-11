@@ -32,6 +32,7 @@ import (
 	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
+	"github.com/charmbracelet/crush/internal/goal"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/log"
@@ -142,17 +143,25 @@ type Coordinator interface {
 }
 
 type coordinator struct {
-	cfg         *config.ConfigStore
-	sessions    session.Service
-	messages    message.Service
-	permissions permission.Service
-	questions   question.Service
-	history     history.Service
-	filetracker filetracker.Service
-	lspManager  *lsp.Manager
-	notify      pubsub.Publisher[notify.Notification]
-	runComplete pubsub.Publisher[notify.RunComplete]
-	interactive bool
+	cfg             *config.ConfigStore
+	sessions        session.Service
+	messages        message.Service
+	permissions     permission.Service
+	questions       question.Service
+	history         history.Service
+	filetracker     filetracker.Service
+	lspManager      *lsp.Manager
+	notify          pubsub.Publisher[notify.Notification]
+	runComplete     pubsub.Publisher[notify.RunComplete]
+	interactive     bool
+	goal            *goal.Service
+	goalWorkspaceID string
+	goalWake        func()
+
+	goalRunMu             sync.Mutex
+	goalRuns              map[string]int
+	goalWakePending       map[string]goal.Token
+	goalIngressGeneration map[string]uint64
 
 	// agentMu guards mainAgent and mainAgentName: SetMainAgent runs on
 	// HTTP handler goroutines while runs, cancels, and probes read the
@@ -218,19 +227,22 @@ type coordinator struct {
 // struct keeps the constructor self-documenting and avoids a long
 // positional parameter list.
 type CoordinatorOptions struct {
-	Config      *config.ConfigStore
-	Sessions    session.Service
-	Messages    message.Service
-	Permissions permission.Service
-	Questions   question.Service
-	History     history.Service
-	FileTracker filetracker.Service
-	LSPManager  *lsp.Manager
-	Notify      pubsub.Publisher[notify.Notification]
-	RunComplete pubsub.Publisher[notify.RunComplete]
-	Skills      *skills.Manager
-	HookRunner  *hooks.Runner
-	Interactive bool
+	Config          *config.ConfigStore
+	Sessions        session.Service
+	Messages        message.Service
+	Permissions     permission.Service
+	Questions       question.Service
+	History         history.Service
+	FileTracker     filetracker.Service
+	LSPManager      *lsp.Manager
+	Notify          pubsub.Publisher[notify.Notification]
+	RunComplete     pubsub.Publisher[notify.RunComplete]
+	Skills          *skills.Manager
+	HookRunner      *hooks.Runner
+	Interactive     bool
+	Goal            *goal.Service
+	GoalWorkspaceID string
+	GoalWake        func()
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -248,24 +260,30 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	skillTracker := skills.NewTracker(activeSkills)
 
 	c := &coordinator{
-		cfg:             opts.Config,
-		sessions:        opts.Sessions,
-		messages:        opts.Messages,
-		permissions:     opts.Permissions,
-		questions:       opts.Questions,
-		history:         opts.History,
-		filetracker:     opts.FileTracker,
-		lspManager:      opts.LSPManager,
-		notify:          opts.Notify,
-		runComplete:     opts.RunComplete,
-		agents:          make(map[string]SessionAgent),
-		allSkills:       allSkills,
-		activeSkills:    activeSkills,
-		skillTracker:    skillTracker,
-		interactive:     opts.Interactive,
-		hookRunner:      opts.HookRunner,
-		dispatched:      csync.NewMap[string, *dispatchedAgent](),
-		backgroundAfter: subAgentBackgroundAfter,
+		cfg:                   opts.Config,
+		sessions:              opts.Sessions,
+		messages:              opts.Messages,
+		permissions:           opts.Permissions,
+		questions:             opts.Questions,
+		history:               opts.History,
+		filetracker:           opts.FileTracker,
+		lspManager:            opts.LSPManager,
+		notify:                opts.Notify,
+		runComplete:           opts.RunComplete,
+		agents:                make(map[string]SessionAgent),
+		allSkills:             allSkills,
+		activeSkills:          activeSkills,
+		skillTracker:          skillTracker,
+		interactive:           opts.Interactive,
+		goal:                  opts.Goal,
+		goalWorkspaceID:       opts.GoalWorkspaceID,
+		goalWake:              opts.GoalWake,
+		goalRuns:              make(map[string]int),
+		goalWakePending:       make(map[string]goal.Token),
+		goalIngressGeneration: make(map[string]uint64),
+		hookRunner:            opts.HookRunner,
+		dispatched:            csync.NewMap[string, *dispatchedAgent](),
+		backgroundAfter:       subAgentBackgroundAfter,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -368,6 +386,17 @@ func (c *coordinator) runReport(ctx context.Context, sessionID string, report me
 }
 
 func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, report *message.SubAgentReport, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
+	marker, _ := goal.CallMarkerFromContext(ctx)
+	admitted, marker := c.beginGoalRunWithIngress(sessionID, marker, report == nil && marker.Kind == goal.CallOrdinary)
+	if !admitted {
+		if accept != nil {
+			accept.Close()
+		}
+		return nil, nil
+	}
+	ctx = goal.WithCallMarker(ctx, marker)
+	defer c.endGoalRun(sessionID)
+
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
 	}
@@ -462,10 +491,11 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, report *mess
 			SessionID:         sessionID,
 			RunID:             runID,
 			Channel:           channel,
+			GoalMarker:        marker,
 			Prompt:            prompt,
 			HostContext:       c.hostContext.Get(),
 			Report:            report,
-			HiddenUserMessage: message.HiddenUserMessage(ctx),
+			HiddenUserMessage: goalCallHidden(marker, message.HiddenUserMessage(ctx)),
 			Attachments:       attachments,
 			MaxOutputTokens:   maxTokens,
 			ProviderOptions:   mergedOptions,
@@ -982,6 +1012,18 @@ func (c *coordinator) buildAgentWithModels(ctx context.Context, ready *errgroup.
 	large := models().Large
 
 	largeProviderCfg, _ := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
+	var goalService *goal.Service
+	var goalWorkspaceID string
+	var goalWake func(goal.Token)
+	var goalWakeAdmission func(string, uint64, goal.Token, func() bool) bool
+	if !isSubAgent {
+		goalService = c.goal
+		goalWorkspaceID = c.goalWorkspaceID
+		if c.goal != nil {
+			goalWake = c.signalGoalWake
+			goalWakeAdmission = c.admitGoalWake
+		}
+	}
 	result := NewSessionAgent(SessionAgentOptions{
 		Models:               models,
 		SystemPromptPrefix:   largeProviderCfg.SystemPromptPrefix,
@@ -996,6 +1038,10 @@ func (c *coordinator) buildAgentWithModels(ctx context.Context, ready *errgroup.
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
 		Hooks:                c.hookRunner,
+		Goal:                 goalService,
+		GoalWorkspaceID:      goalWorkspaceID,
+		GoalWake:             goalWake,
+		GoalWakeAdmission:    goalWakeAdmission,
 		titles:               &c.titles,
 	})
 
@@ -1044,7 +1090,12 @@ func (c *coordinator) buildAgentWithModels(ctx context.Context, ready *errgroup.
 // detaches here. Subagents get neither, since they can neither fan out nor
 // ask questions.
 func (c *coordinator) effectiveToolNames(agentCfg config.Agent, isSubAgent bool) []string {
-	return slices.DeleteFunc(slices.Clone(agentCfg.AllowedTools), func(name string) bool {
+	var disabledTools []string
+	if c.cfg != nil && c.cfg.Config() != nil && c.cfg.Config().Options != nil {
+		disabledTools = c.cfg.Config().Options.DisabledTools
+	}
+	allowed := effectiveGoalToolNames(agentCfg.AllowedTools, isSubAgent, c.goal != nil, disabledTools)
+	return slices.DeleteFunc(allowed, func(name string) bool {
 		switch name {
 		case tools.QuestionToolName:
 			return isSubAgent || !c.interactive
@@ -1063,6 +1114,9 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	allowed := c.effectiveToolNames(agent, isSubAgent)
 
 	var allTools []fantasy.AgentTool
+	if slices.Contains(allowed, tools.CompleteGoalToolName) {
+		allTools = append(allTools, tools.NewCompleteGoalTool(goalCompleter(c.goal)))
+	}
 	if slices.Contains(allowed, AgentToolName) {
 		agentTool, err := c.agentTool(ctx, agent.ID)
 		if err != nil {
@@ -1727,7 +1781,29 @@ func (c *coordinator) QueuedPromptsList(sessionID string) []string {
 	return c.currentAgent().QueuedPromptsList(sessionID)
 }
 
+// RemoveGoalInitial removes a canceled pending initial from every main-agent
+// queue, including one queued before a main-agent switch.
+func (c *coordinator) RemoveGoalInitial(token goal.Token) {
+	c.agentMu.RLock()
+	agents := make([]SessionAgent, 0, len(c.agents))
+	for _, agent := range c.agents {
+		agents = append(agents, agent)
+	}
+	c.agentMu.RUnlock()
+
+	for _, agent := range agents {
+		if queue, ok := agent.(GoalInitialQueue); ok {
+			queue.RemoveGoalInitial(token)
+		}
+	}
+}
+
 func (c *coordinator) Summarize(ctx context.Context, sessionID string) error {
+	admitted, _ := c.beginGoalRunWithIngress(sessionID, goal.CallMarker{}, true)
+	if !admitted {
+		return nil
+	}
+	defer c.endGoalRun(sessionID)
 	agent := c.currentAgent()
 	providerCfg, ok := c.cfg.Config().Providers.Get(agent.Model().ModelCfg.Provider)
 	if !ok {
